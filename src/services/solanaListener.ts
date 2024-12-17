@@ -237,16 +237,16 @@ export const startTokenListener = async (userId: number): Promise<void> => {
                 await botInstance.api.sendMessage(uid, message, { parse_mode: 'HTML' });
 
                 // Perform the token purchase
-                const purchaseSuccess = await purchaseToken(uid, tokenInfo);
+                //const purchaseSuccess = await purchaseToken(uid, tokenInfo);
 
                 // Stop the listener for this user regardless of purchase success
-                activeUserIds.delete(uid);
+                //activeUserIds.delete(uid);
                 
-                if (purchaseSuccess) {
-                  logger.info(`Listener stopped for user ${uid} after successful token purchase.`);
-                } else {
-                  logger.info(`Listener stopped for user ${uid} after failed token purchase.`);
-                }
+                // if (purchaseSuccess) {
+                //   logger.info(`Listener stopped for user ${uid} after successful token purchase.`);
+                // } else {
+                //   logger.info(`Listener stopped for user ${uid} after failed token purchase.`);
+                // }
 
                 // Optionally, notify the user that the listener has been stopped
                 // await notifyUserById(uid, `🔔 Token detection has been stopped.`);
