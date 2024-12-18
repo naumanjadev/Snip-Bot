@@ -89,6 +89,37 @@ export const handleSetTopHoldersCommand = async (ctx: MyContext): Promise<void> 
   }
 };
 
+export const handleAutoBuyCommand = async (ctx: MyContext): Promise<void> => {
+  if (!ctx.session.awaitingInputFor) {
+    await ctx.reply('Would you like to enable auto-buy for detected tokens? (yes/no/no preference):');
+    ctx.session.awaitingInputFor = 'set_auto_buy';
+  } else {
+    const input = ctx.message?.text?.trim().toLowerCase();
+    const userId = ctx.from?.id;
+
+    if (!userId || input === undefined) {
+      await ctx.reply('Unable to process your request.');
+      ctx.session.awaitingInputFor = undefined;
+      return;
+    }
+
+    if (input === 'yes') {
+      await updateUserSettings(userId, { Autobuy: true });
+      await ctx.reply('Auto-buy enabled for detected tokens.');
+    } else if (input === 'no') {
+      await updateUserSettings(userId, { Autobuy: false });
+      await ctx.reply('Auto-buy disabled for detected tokens.');
+    } else if (input === 'no preference') {
+      await updateUserSettings(userId, { Autobuy: null });
+      await ctx.reply('Auto-buy preference removed.');
+    } else {
+      await ctx.reply('Please respond with "yes", "no", or "no preference".');
+      return;
+    }
+    ctx.session.awaitingInputFor = undefined;
+  }
+}
+
 export const handleShowFiltersCommand = async (ctx: MyContext): Promise<void> => {
   const userId = ctx.from?.id;
 
@@ -109,10 +140,17 @@ export const handleShowFiltersCommand = async (ctx: MyContext): Promise<void> =>
       : 'No preference';
   const topHoldersThresholdText =
     settings.topHoldersThreshold !== null ? `${settings.topHoldersThreshold}%` : 'No limit';
+  const autoBuyText =
+    settings.Autobuy === true
+      ? 'Enabled'
+      : settings.Autobuy === false
+      ? 'Disabled'
+      : 'No preference';
 
   const filters = `<b>Your current filters are:</b>
 - <b>Liquidity Threshold:</b> ${liquidityThresholdText}
 - <b>Mint Authority Required:</b> ${requireMintAuthorityText}
+- <b>Auto-buy:</b> ${autoBuyText}
 - <b>Top Holders Concentration Threshold:</b> ${topHoldersThresholdText}`;
 
   await ctx.reply(filters, { parse_mode: 'HTML' });

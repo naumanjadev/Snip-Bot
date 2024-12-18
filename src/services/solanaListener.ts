@@ -11,6 +11,7 @@ import axios from 'axios';
 import { fetchTokenMetadata } from './tokenMetadataService'; // Import the metadata fetcher
 import { getMintWithRateLimit } from './rpcRateLimiter'; // Import the rate-limited getMint
 import { Mint } from '@solana/spl-token';
+import { getUserSettings } from './userSettingsService'; // Import getUserSettings
 
 // DexScreener API Endpoint
 const DEXSCREENER_TOKENS_URL = 'https://api.dexscreener.com/latest/dex/tokens/';
@@ -68,11 +69,13 @@ const fetchTokenDetails = async (tokenAddress: string): Promise<any | null> => {
  * Constructs a detailed and catchy message with token information.
  * @param tokenInfo Basic token information.
  * @param dexData Detailed token information from DexScreener.
+ * @param autobuy Indicates whether Autobuy is enabled.
  * @returns Formatted message string.
  */
 const constructTokenMessage = async (
   tokenInfo: TokenInfo,
-  dexData: any
+  dexData: any,
+  autobuy: boolean
 ): Promise<string> => {
   const tokenAddress = tokenInfo.mintAddress;
 
@@ -104,6 +107,11 @@ const constructTokenMessage = async (
       ? new Date(tokenDetails.creationTime * 1000).toUTCString()
       : 'N/A';
 
+    // Determine the buying status message
+    const buyingStatus = autobuy
+      ? '➡️ <b>Buying Token...</b>'
+      : '🔒 <b>Autobuy is OFF. Token not purchased.</b> Please enable Autobuy to perform automatic purchases.';
+
     return `🚀 <b>🔥 New Token Alert!</b>
 
 <b>Token Name:</b> ${baseToken.name || 'N/A'}
@@ -123,7 +131,7 @@ const constructTokenMessage = async (
 
 💥 <i>This token has passed all your filters!</i>
 
-➡️ <b>Buying Token...</b>
+${buyingStatus}
 
 🔔 To listen for more tokens, use /start_listener.
 `;
@@ -132,6 +140,11 @@ const constructTokenMessage = async (
     const metadata = await fetchTokenMetadata(tokenAddress);
     const name = metadata?.name || 'N/A';
     const symbol = metadata?.symbol || 'N/A';
+
+    // Determine the buying status message
+    const buyingStatus = autobuy
+      ? '💰 <b>Buying Token...</b>'
+      : '🔒 <b>Autobuy is OFF. Token not purchased.</b> Please enable Autobuy to perform automatic purchases.';
 
     if (name === 'N/A' && symbol === 'N/A') {
       // Both DexScreener and Metaplex failed to provide details
@@ -143,7 +156,7 @@ const constructTokenMessage = async (
 
 💡 <i>Additional details are unavailable.</i>
 
-💰 <b>Buying Token...</b>
+${buyingStatus}
 
 🔔 To listen for more tokens, use /start_listener.
 `;
@@ -159,7 +172,7 @@ const constructTokenMessage = async (
 
 💡 <i>Additional details are unavailable.</i>
 
-💰 <b>Buying Token...</b>
+${buyingStatus}
 
 🔔 To listen for more tokens, use /start_listener.
 `;
@@ -230,26 +243,36 @@ export const startTokenListener = async (userId: number): Promise<void> => {
                   );
                 }
 
+                // Fetch user settings to check Autobuy status
+                const userSettings = await getUserSettings(uid);
+                const autobuy: boolean = userSettings.Autobuy === true;
+
                 // Construct the detailed message
-                const message = await constructTokenMessage(tokenInfo, dexData);
+                const message = await constructTokenMessage(tokenInfo, dexData, autobuy);
 
                 // Send the message to the user via Telegram
                 await botInstance.api.sendMessage(uid, message, { parse_mode: 'HTML' });
 
-                // Perform the token purchase
-                //const purchaseSuccess = await purchaseToken(uid, tokenInfo);
+                if (autobuy) {
+                  // Perform the token purchase
+                  const purchaseSuccess = await purchaseToken(uid, tokenInfo);
 
-                // Stop the listener for this user regardless of purchase success
-                //activeUserIds.delete(uid);
-                
-                // if (purchaseSuccess) {
-                //   logger.info(`Listener stopped for user ${uid} after successful token purchase.`);
-                // } else {
-                //   logger.info(`Listener stopped for user ${uid} after failed token purchase.`);
-                // }
+                  if (purchaseSuccess) {
+                    logger.info(`Token ${accountId} successfully purchased for user ${uid}.`);
+                    // Notify the user about the successful purchase
+                    await botInstance.api.sendMessage(uid, `✅ <b>Token purchased successfully!</b>`, { parse_mode: 'HTML' });
+                  } else {
+                    logger.error(`Failed to purchase token ${accountId} for user ${uid}.`);
+                    // Notify the user about the failed purchase
+                    await botInstance.api.sendMessage(uid, `❌ <b>Failed to purchase the token.</b> Please check your settings or try again later.`, { parse_mode: 'HTML' });
+                  }
+                } else {
+                  // Inform the user that Autobuy is off
+                  logger.info(`Autobuy is OFF for user ${uid}. Token ${accountId} not purchased.`);
+                  await botInstance.api.sendMessage(uid, `ℹ️ <b>Autobuy is OFF. Token not purchased.</b> You can enable Autobuy in your settings if you wish to perform automatic purchases.`, { parse_mode: 'HTML' });
+                }
 
-                // Optionally, notify the user that the listener has been stopped
-                // await notifyUserById(uid, `🔔 Token detection has been stopped.`);
+                // Keep the listener active; do not remove the user from activeUserIds
               } else {
                 logger.debug(
                   `Token ${accountId} did not pass filters for user ${uid}.`

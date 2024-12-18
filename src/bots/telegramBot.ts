@@ -19,12 +19,12 @@ import {
   handleSetTopHoldersCommand,
   handleStartListenerCommand,
   handleStopListenerCommand,
+  handleAutoBuyCommand,
   handleShowFiltersCommand,
 } from '../controllers/filterController';
 import { PublicKey } from '@solana/web3.js';
 import { MyContext, SessionData } from '../types';
 
-// Define the session data structure
 type MySession = SessionData;
 
 /**
@@ -56,14 +56,11 @@ export const createBot = (): Bot<MyContext> => {
 
   const bot = new Bot<MyContext>(config.telegramBotToken);
 
-  // Initialize session middleware
   bot.use(session({ initial: (): MySession => ({}) }));
 
-  // Middleware to reset session data when a new command is received
   bot.use(async (ctx, next) => {
     if (ctx.message && ctx.message.text && ctx.message.text.startsWith('/')) {
       ctx.session.awaitingInputFor = undefined;
-      // Keep awaitingConfirmation if it's for delete or export wallet or withdrawal confirmation
       const currentCommand = ctx.message.text.split(' ')[0];
       const confirmationCommands = ['/cancel', '/confirm_withdraw'];
       if (!confirmationCommands.includes(currentCommand)) {
@@ -75,7 +72,6 @@ export const createBot = (): Bot<MyContext> => {
     await next();
   });
 
-  // /start command handler
   bot.command('start', async (ctx) => {
     const welcomeMessage = `
 👋 <b>Welcome to the Solana Trading Bot!</b>
@@ -124,6 +120,7 @@ Please choose an option:
 Please choose a filter to set:
 /set_liquidity - Set liquidity threshold
 /set_mint_authority - Set mint authority requirement
+/set_auto_buy - Set auto-buy preference
 /set_top_holders - Set top holders concentration threshold
     `;
     await ctx.reply(message, { parse_mode: 'HTML' });
@@ -133,6 +130,7 @@ Please choose a filter to set:
   bot.command(['set_mint_authority', 'setmintauthority'], handleSetMintAuthorityCommand);
   bot.command(['set_top_holders', 'settopholders'], handleSetTopHoldersCommand);
   bot.command(['show_filters', 'showfilters'], handleShowFiltersCommand);
+  bot.command(['set_auto_buy', 'setautobuy'], handleAutoBuyCommand);
 
   // Listener commands with aliases
   bot.command(['start_listener', 'startlistener'], handleStartListenerCommand);
@@ -142,7 +140,6 @@ Please choose a filter to set:
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     if (text && text.startsWith('/')) {
-      // It's a command, do nothing here
       return;
     }
 
@@ -155,9 +152,10 @@ Please choose a filter to set:
         await handleSetMintAuthorityCommand(ctx);
       } else if (awaitingInputFor === 'set_top_holders') {
         await handleSetTopHoldersCommand(ctx);
+      } else if (awaitingInputFor === 'set_auto_buy') {
+        await handleAutoBuyCommand(ctx);
       } else if (awaitingInputFor === 'withdraw_address') {
         const input = ctx.message.text.trim();
-        // Validate Solana address
         try {
           new PublicKey(input);
           ctx.session.withdrawAddress = input;
@@ -169,7 +167,6 @@ Please choose a filter to set:
       } else if (awaitingInputFor === 'withdraw_amount') {
         await handleWithdrawAmountInput(ctx);
       } else if (awaitingConfirmation === 'withdraw') {
-        // Waiting for user to confirm withdrawal
         const input = ctx.message.text.trim().toLowerCase();
         if (input === 'yes') {
           await handleConfirmWithdraw(ctx);
@@ -178,36 +175,28 @@ Please choose a filter to set:
           ctx.session.awaitingConfirmation = undefined;
         }
       } else if (awaitingConfirmation === 'delete_wallet') {
-        // Handle delete wallet confirmation
         await handleDeleteWalletCommand(ctx);
       } else if (awaitingConfirmation === 'export_wallet') {
-        // Handle export wallet confirmation
         await handleExportWalletCommand(ctx);
       } else {
-        // No specific handler, reset session data
         ctx.session.awaitingInputFor = undefined;
         ctx.session.awaitingConfirmation = undefined;
         await ctx.reply('❗️ Please use the available commands. Type /help to see the list of commands.');
       }
     } else {
-      // No awaiting input or confirmation, inform the user
       await ctx.reply('❗️ Please use the available commands. Type /help to see the list of commands.');
     }
   });
 
-  // Handle unknown commands and non-command messages
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     if (text && text.startsWith('/')) {
-      // Unknown command
       await ctx.reply('❌ Unknown command. Type /help to see the list of available commands.');
     } else {
-      // Non-command messages
       await ctx.reply('❗️ Please use the available commands. Type /help to see the list of commands.');
     }
   });
 
-  // Error handling
   bot.catch((err) => {
     const ctx = err.ctx;
     logger.error(`Error while handling update ${ctx.update.update_id}: ${(err.error as Error).message}`);
@@ -224,5 +213,4 @@ export const notifyUserById = async (userId: number, message: string): Promise<v
   }
 };
 
-// Create and export the bot instance
 export const botInstance = createBot();
