@@ -1,4 +1,11 @@
-import { Connection, Keypair, PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  VersionedTransaction,
+  TransactionSignature,
+  Commitment,
+} from '@solana/web3.js';
 import {
   createJupiterApiClient,
   QuoteGetRequest,
@@ -7,6 +14,38 @@ import {
   SwapResponse,
 } from '@jup-ag/api';
 import { logger } from '../utils/logger';
+
+/**
+ * Confirms a transaction with retries.
+ * @param connection 
+ * @param txid 
+ * @param maxRetries 
+ * @param delayMs 
+ * @returns 
+ */
+async function confirmTransactionWithRetry(
+  connection: Connection,
+  txid: TransactionSignature,
+  maxRetries: number = 3,
+  delayMs: number = 10000
+): Promise<boolean> {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const confirmation = await connection.confirmTransaction(txid, 'finalized' as Commitment);
+      if (confirmation.value.err) {
+        logger.error(`Transaction ${txid} failed: ${JSON.stringify(confirmation.value.err)}`);
+        return false;
+      }
+      return true;
+    } catch (err: any) {
+      logger.warn(`Attempt ${i + 1} to confirm transaction ${txid} failed: ${err.message}`);
+      if (i < maxRetries - 1) {
+        await new Promise((res) => setTimeout(res, delayMs));
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Performs a token swap using the Jupiter aggregator.
@@ -20,15 +59,9 @@ export const swapTokens = async (params: {
   destinationTokenMint: PublicKey;
   amountInLamports: number;
 }): Promise<boolean> => {
-  try {
-    const {
-      connection,
-      walletKeypair,
-      sourceTokenMint,
-      destinationTokenMint,
-      amountInLamports,
-    } = params;
+  const { connection, walletKeypair, sourceTokenMint, destinationTokenMint, amountInLamports } = params;
 
+  try {
     // Initialize Jupiter API client
     const jupiterApi = createJupiterApiClient();
 
@@ -37,62 +70,119 @@ export const swapTokens = async (params: {
       inputMint: sourceTokenMint.toBase58(),
       outputMint: destinationTokenMint.toBase58(),
       amount: amountInLamports,
-      slippageBps: 50, // 0.5% slippage
+      // We won't rely solely on slippageBps; 
+      // We'll let dynamic slippage and dynamic compute unit limit handle it as per reference code.
+      slippageBps: 50,
     };
 
     logger.debug(`Jupiter Quote Request: ${JSON.stringify(quoteRequest, null, 2)}`);
 
-    // Fetch quote
-    const quoteResponse: QuoteResponse = await jupiterApi.quoteGet(quoteRequest);
-
-    // Log the raw quote response for debugging
-    logger.debug(`Raw Quote Response: ${JSON.stringify(quoteResponse, null, 2)}`);
-
-    // Validate the quote response
-    if (!quoteResponse) {
-      logger.error('No quote received for the swap.');
+    let quoteResponse: QuoteResponse | null = null;
+    try {
+      quoteResponse = await jupiterApi.quoteGet(quoteRequest);
+    } catch (err: any) {
+      logger.error(`Failed to fetch quote from Jupiter: ${err.message}`);
+      if (err.response && err.response.data) {
+        logger.error(`Jupiter API Error: ${JSON.stringify(err.response.data, null, 2)}`);
+      }
       return false;
     }
 
-    // Prepare the swap request
+    logger.debug(`Raw Quote Response: ${JSON.stringify(quoteResponse, null, 2)}`);
+
+    // Check if we got a valid route
+    if (!quoteResponse) {
+      logger.error('No valid swap routes found for the given token pair.');
+      return false;
+    }
+
+    // Prepare the swap request (using some dynamic parameters for better reliability)
     const swapRequest: SwapPostRequest = {
       swapRequest: {
-        quoteResponse, // Use the entire quote response
+        quoteResponse,
         userPublicKey: walletKeypair.publicKey.toBase58(),
-        wrapAndUnwrapSol: true, // Automatically wrap and unwrap SOL if needed
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        dynamicSlippage: {
+          maxBps: 300 // maximum slippage bps set to prevent MEV or too large slippage
+        },
+        prioritizationFeeLamports: {
+          priorityLevelWithMaxLamports: {
+            maxLamports: 10000000, // 0.01 SOL max
+            priorityLevel: "veryHigh",
+          },
+        },
       },
     };
 
     logger.debug(`Jupiter Swap Request: ${JSON.stringify(swapRequest, null, 2)}`);
 
-    // Fetch the swap transaction
-    const swapResponse: SwapResponse = await jupiterApi.swapPost(swapRequest);
+    let swapResponse: SwapResponse | null = null;
+    try {
+      swapResponse = await jupiterApi.swapPost(swapRequest);
+    } catch (err: any) {
+      logger.error(`Failed to execute swap on Jupiter: ${err.message}`);
+      if (err.response && err.response.data) {
+        logger.error(`Jupiter API Error: ${JSON.stringify(err.response.data, null, 2)}`);
+      }
+      return false;
+    }
 
     logger.debug(`Jupiter Swap Response: ${JSON.stringify(swapResponse, null, 2)}`);
 
-    // Validate the swap response
-    if (!swapResponse.swapTransaction) {
+    if (!swapResponse || !swapResponse.swapTransaction) {
       logger.error('Failed to get swap transaction from Jupiter.');
       return false;
     }
 
     // Deserialize the transaction
-    const swapTransactionBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
-    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    let transaction: VersionedTransaction;
+    try {
+      const swapTransactionBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
+      transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    } catch (err: any) {
+      logger.error(`Failed to deserialize the swap transaction: ${err.message}`);
+      return false;
+    }
 
     // Sign the transaction
     transaction.sign([walletKeypair]);
 
+    // Simulate transaction before sending
+    try {
+      const simulationResult = await connection.simulateTransaction(transaction, {
+        replaceRecentBlockhash: true,
+        commitment: "processed",
+      });
+
+      const { err, logs } = simulationResult.value;
+      if (err) {
+        logger.error('Transaction simulation failed:', err, logs);
+        return false;
+      }
+    } catch (simulateErr: any) {
+      logger.error(`Failed to simulate transaction: ${simulateErr.message}`);
+      return false;
+    }
+
     // Send the transaction
-    const txid = await connection.sendRawTransaction(transaction.serialize());
+    let txid: string;
+    try {
+      txid = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+        maxRetries: 2,
+      });
+    } catch (err: any) {
+      logger.error(`Failed to send transaction: ${err.message}`);
+      return false;
+    }
 
     logger.info(`Swap transaction sent. TXID: ${txid}`);
 
-    // Confirm the transaction
-    const confirmation = await connection.confirmTransaction(txid, 'confirmed');
-
-    if (confirmation.value.err) {
-      logger.error('Transaction failed:', confirmation.value.err);
+    // Confirm the transaction with retries
+    const confirmed = await confirmTransactionWithRetry(connection, txid, 3, 10000);
+    if (!confirmed) {
+      logger.error(`Transaction ${txid} was not confirmed after multiple attempts.`);
       return false;
     }
 

@@ -16,7 +16,13 @@ import { logger } from '../utils/logger';
 // You can store multiple RPC URLs for load distribution
 const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=34f4403f-f9da-4d03-a6df-3de140c97f06',
-  // Add more RPC URLs if available for load balancing/failover
+  'https://mainnet.helius-rpc.com/?api-key=a10fd0ea-2f74-4fb0-bcc3-81dea10eed97',
+  'https://mainnet.helius-rpc.com/?api-key=b8332ac9-558f-4da7-9de0-01d8f9c139f0',
+  'https://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4',
+  'https://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4',
+  'https://mainnet.helius-rpc.com/?api-key=a7582ece-e219-452b-a37f-5a81d45c54d8',
+
+  // Add more RPC URLs if available for load balancing/failoverhttps://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4
 ];
 
 const connections = rpcUrls.map(url => new Connection(url, 'confirmed'));
