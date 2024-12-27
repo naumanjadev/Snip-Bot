@@ -6,15 +6,10 @@ import {
   TokenAmount,
   ParsedAccountData,
   TokenAccountBalancePair,
-  KeyedAccountInfo,
 } from '@solana/web3.js';
 import { getMint, Mint } from '@solana/spl-token';
 import { logger } from '../utils/logger';
 
-/**
- * List your RPC endpoints carefully. 
- * Avoid duplicates, or you risk quickly blacklisting them all.
- */
 const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=34f4403f-f9da-4d03-a6df-3de140c97f06',
   'https://mainnet.helius-rpc.com/?api-key=a10fd0ea-2f74-4fb0-bcc3-81dea10eed97',
@@ -30,88 +25,86 @@ interface RpcConnection {
   limiter: Bottleneck;
   blacklistedUntil: number;
   consecutiveErrors: number;
-  requestCount: number;  // Track requests instead of using reservoir
+  lastUsed: number;
 }
 
-// Create more conservative rate limits per connection
+// Much stricter rate limits per connection
 const createConnectionLimiter = () => new Bottleneck({
-  maxConcurrent: 1,             // One request at a time
-  minTime: 500,                 // 500ms between requests (~2 req/sec)
+  maxConcurrent: 1,
+  minTime: 1000,              // Minimum 1 second between requests
+  reservoir: 10,              // Start with 10 tokens
+  reservoirRefreshAmount: 10, // Refill to 10 tokens
+  reservoirRefreshInterval: 60 * 1000  // Every 60 seconds
 });
 
-// Initialize connections with individual rate limiters
+// Significantly reduced global rate limiting
+const globalLimiter = new Bottleneck({
+  maxConcurrent: 2,          // Only 2 concurrent requests globally
+  minTime: 200,              // 200ms between any requests
+  reservoir: 30,             // 30 requests per minute total
+  reservoirRefreshAmount: 30,
+  reservoirRefreshInterval: 60 * 1000
+});
+
 const rpcConnections: RpcConnection[] = rpcUrls.map((url) => ({
   url,
-  connection: new Connection(url, 'confirmed'),
+  connection: new Connection(url, {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true, // We'll handle retries ourselves
+  }),
   limiter: createConnectionLimiter(),
   blacklistedUntil: 0,
   consecutiveErrors: 0,
-  requestCount: 0,
+  lastUsed: 0,
 }));
-
-// Global limiter for overall rate control
-const globalLimiter = new Bottleneck({
-  maxConcurrent: 3,           // Allow 3 concurrent requests
-  minTime: 100,               // Minimum 100ms between requests
-});
-
-// Reset request counts every minute
-setInterval(() => {
-  rpcConnections.forEach(conn => {
-    conn.requestCount = 0;
-  });
-}, 60 * 1000);
 
 const getHealthyConnection = (): RpcConnection | null => {
   const now = Date.now();
+  
+  // Remove blacklisting for connections that have cooled down
+  rpcConnections.forEach(conn => {
+    if (conn.blacklistedUntil <= now) {
+      conn.blacklistedUntil = 0;
+      if (now - conn.lastUsed > 120000) { // 2 minutes without use
+        conn.consecutiveErrors = 0; // Reset errors after cooling period
+      }
+    }
+  });
+
+  // Filter available connections
   const available = rpcConnections.filter(c => 
     c.blacklistedUntil <= now && 
-    c.consecutiveErrors < 3 &&
-    c.requestCount < 15  // Max 15 requests per minute
+    c.consecutiveErrors < 2 && // More aggressive error threshold
+    (now - c.lastUsed) >= 1000 // Ensure 1 second between uses of same connection
   );
 
   if (available.length === 0) {
-    // Try to find any connection that's not blacklisted
-    const notBlacklisted = rpcConnections.filter(c => c.blacklistedUntil <= now);
-    if (notBlacklisted.length === 0) {
-      logger.warn('All endpoints are blacklisted, waiting for cooldown');
-      return null;
+    logger.warn('No healthy connections available, waiting for cooldown...');
+    return null;
+  }
+
+  // Sort by least recently used and least errors
+  available.sort((a, b) => {
+    const timeDiff = a.lastUsed - b.lastUsed;
+    if (Math.abs(timeDiff) > 5000) { // Significant time difference
+      return timeDiff;
     }
-    // Use the one with the least consecutive errors
-    return notBlacklisted.sort((a, b) => a.consecutiveErrors - b.consecutiveErrors)[0];
-  }
+    return a.consecutiveErrors - b.consecutiveErrors;
+  });
 
-  // Return the connection with the least requests
-  return available.sort((a, b) => a.requestCount - b.requestCount)[0];
-};
-
-// Export for backward compatibility with existing code
-export const getRandomConnection = (): Connection => {
-  const conn = getHealthyConnection();
-  if (!conn) {
-    // Fallback to first connection if all are blacklisted
-    return rpcConnections[0].connection;
-  }
-  return conn.connection;
+  return available[0];
 };
 
 const blacklistConnection = (connection: RpcConnection) => {
   connection.consecutiveErrors++;
   const blacklistDuration = Math.min(
-    120_000 * Math.pow(2, connection.consecutiveErrors - 1), // Exponential backoff
-    600_000 // Max 10 minutes
+    180_000 * Math.pow(2, connection.consecutiveErrors - 1), // Longer backoff
+    900_000 // Max 15 minutes
   );
   connection.blacklistedUntil = Date.now() + blacklistDuration;
   logger.warn(
     `Endpoint blacklisted for ${blacklistDuration/1000}s after ${connection.consecutiveErrors} errors: ${connection.url}`
   );
-};
-
-const resetConnectionErrors = (connection: RpcConnection) => {
-  if (connection.consecutiveErrors > 0) {
-    connection.consecutiveErrors = 0;
-    logger.debug(`Reset error count for endpoint: ${connection.url}`);
-  }
 };
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -123,34 +116,41 @@ async function executeWithRetry<T>(
   maxRetries = 3
 ): Promise<T> {
   let lastError: Error | null = null;
+  let baseDelay = 2000; // Start with 2 second base delay
   
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      connection.requestCount++;
+      connection.lastUsed = Date.now();
+      
+      // Use both limiters in series
       const result = await globalLimiter.schedule(() =>
         connection.limiter.schedule(operation)
       );
-      resetConnectionErrors(connection);
+      
+      connection.consecutiveErrors = 0; // Reset errors on success
       return result;
     } catch (error: any) {
       lastError = error;
-      logger.error(`Attempt ${attempt + 1}/${maxRetries + 1} failed for ${description}:`, error);
+      logger.error(
+        `Attempt ${attempt + 1}/${maxRetries + 1} failed for ${description}:`,
+        error.message || error
+      );
 
-      const is429 = error.message?.includes('429') || error.message?.includes('Too Many Requests');
-      const isRetryable = is429 || 
-        error.message?.includes('timeout') ||
-        error.message?.includes('connection reset');
-
+      const is429 = error.message?.includes('429') || 
+                    error.message?.includes('Too Many Requests');
+      
       if (is429) {
         blacklistConnection(connection);
+        // Increase base delay after each 429
+        baseDelay = Math.min(baseDelay * 2, 8000);
       }
 
-      if (!isRetryable || attempt === maxRetries) {
-        break;
-      }
+      if (attempt === maxRetries) break;
 
-      const backoff = Math.min(1000 * Math.pow(2, attempt), 8000);
-      await delay(backoff + Math.random() * 1000);
+      // Calculate backoff with jitter
+      const jitter = Math.random() * 1000;
+      const backoff = baseDelay * Math.pow(2, attempt) + jitter;
+      await delay(backoff);
     }
   }
 
@@ -162,10 +162,12 @@ async function executeWithFallback<T>(
   description: string,
   maxAttempts = 3
 ): Promise<T> {
+  let lastError: Error | null = null;
+
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const connection = getHealthyConnection();
     if (!connection) {
-      await delay(2000);
+      await delay(3000); // Longer delay when no connections available
       continue;
     }
 
@@ -175,12 +177,21 @@ async function executeWithFallback<T>(
         description,
         connection
       );
-    } catch (error) {
-      if (attempt === maxAttempts - 1) throw error;
+    } catch (error: any) {
+      lastError = error;
+      if (attempt === maxAttempts - 1) break;
+      await delay(2000); // Delay before trying next connection
     }
   }
-  throw new Error(`All attempts failed for: ${description}`);
+
+  throw lastError || new Error(`All attempts failed for: ${description}`);
 }
+
+// Export for backward compatibility
+export const getRandomConnection = (): Connection => {
+  const conn = getHealthyConnection();
+  return conn ? conn.connection : rpcConnections[0].connection;
+};
 
 export const getMintWithRateLimit = async (mintAddress: string): Promise<Mint> =>
   executeWithFallback(
