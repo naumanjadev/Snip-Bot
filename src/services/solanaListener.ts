@@ -1,22 +1,31 @@
 // src/services/solanaListener.ts
 
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { applyFilters } from './tokenFilters';
 import { TokenInfo } from '../types';
 import { purchaseToken } from './purchaseService';
-import { botInstance } from '../bots/telegramBot'; // Import the exported bot instance
+import { botInstance } from '../bots/telegramBot'; 
 import axios from 'axios';
-import { fetchTokenMetadata } from './tokenMetadataService'; // Import the metadata fetcher
-import { getMintWithRateLimit } from './rpcRateLimiter'; // Import the rate-limited getMint
-import { Mint } from '@solana/spl-token';
-import { getUserSettings } from './userSettingsService'; // Import getUserSettings
+import { fetchTokenMetadata } from './tokenMetadataService';
+import { getUserSettings } from './userSettingsService';
 
+// -------------------------------------
+// Import from your rate-limiter file
+// -------------------------------------
+import {
+  getRandomConnection, // for the subscription
+} from './rpcRateLimiter';
+
+// -------------------------------------
 // DexScreener API Endpoint
+// -------------------------------------
 const DEXSCREENER_TOKENS_URL = 'https://api.dexscreener.com/latest/dex/tokens/';
 
+// -------------------------------------
 // Validate Mint Address
+// -------------------------------------
 const isValidMint = (address: string): boolean => {
   try {
     new PublicKey(address);
@@ -26,12 +35,18 @@ const isValidMint = (address: string): boolean => {
   }
 };
 
-// Connection to Solana RPC
-export const connection: Connection = new Connection(config.solanaRpcUrl, 'confirmed');
+// -------------------------------------
+// Instead of a single connection, use a
+// random connection for the subscription
+// -------------------------------------
+let subscriptionConnection = getRandomConnection();
 
+// -------------------------------------
+// Listener state
+// -------------------------------------
 let listenerId: number | null = null;
 const activeUserIds: Set<number> = new Set();
-let isProcessing: boolean = false; // Flag to prevent concurrent processing
+let isProcessing = false; // prevents overlapping calls
 
 /**
  * Fetch detailed token information from DexScreener.
@@ -80,19 +95,19 @@ const constructTokenMessage = async (
   const tokenAddress = tokenInfo.mintAddress;
 
   // Log the DexScreener data structure
-  logger.debug(`Constructing message with DexScreener data: ${JSON.stringify(dexData, null, 2)}`);
+  logger.debug(
+    `Constructing message with DexScreener data: ${JSON.stringify(dexData, null, 2)}`
+  );
 
   // Adjust access based on DexScreener's response structure
-  const pairs = dexData.pairs || dexData.data?.pairs;
-
+  const pairs = dexData?.pairs || dexData?.data?.pairs;
   if (pairs && pairs.length > 0) {
     const tokenDetails = pairs[0];
     const baseToken = tokenDetails.baseToken || {};
-    const quoteToken = tokenDetails.quoteToken || {};
     const priceUsd = tokenDetails.priceUsd
       ? parseFloat(tokenDetails.priceUsd).toFixed(6)
       : 'N/A';
-    const liquidity = tokenDetails.liquidity?.usd
+    const liquidity = tokenDetails?.liquidity?.usd
       ? parseFloat(tokenDetails.liquidity.usd).toLocaleString()
       : 'N/A';
     const fdv = tokenDetails.fdv
@@ -101,8 +116,7 @@ const constructTokenMessage = async (
     const marketCap = tokenDetails.marketCap
       ? parseFloat(tokenDetails.marketCap).toLocaleString()
       : 'N/A';
-    const dexUrl =
-      tokenDetails.url || `https://dexscreener.com/solana/${tokenAddress}`;
+    const dexUrl = tokenDetails.url || `https://dexscreener.com/solana/${tokenAddress}`;
     const creationTime = tokenDetails.creationTime
       ? new Date(tokenDetails.creationTime * 1000).toUTCString()
       : 'N/A';
@@ -110,7 +124,7 @@ const constructTokenMessage = async (
     // Determine the buying status message
     const buyingStatus = autobuy
       ? '➡️ <b>Buying Token...</b>'
-      : '🔒 <b>Autobuy is OFF. Token not purchased.</b> Please enable Autobuy to perform automatic purchases.';
+      : '🔒 <b>Autobuy is OFF. Token not purchased.</b>';
 
     return `🚀 <b>🔥 New Token Alert!</b>
 
@@ -141,10 +155,9 @@ ${buyingStatus}
     const name = metadata?.name || 'N/A';
     const symbol = metadata?.symbol || 'N/A';
 
-    // Determine the buying status message
     const buyingStatus = autobuy
       ? '💰 <b>Buying Token...</b>'
-      : '🔒 <b>Autobuy is OFF. Token not purchased.</b> Please enable Autobuy to perform automatic purchases.';
+      : '🔒 <b>Autobuy is OFF. Token not purchased.</b>';
 
     if (name === 'N/A' && symbol === 'N/A') {
       // Both DexScreener and Metaplex failed to provide details
@@ -183,6 +196,7 @@ ${buyingStatus}
  * Starts the token listener for a specific user.
  */
 export const startTokenListener = async (userId: number): Promise<void> => {
+  // Prevent re-start for the same user
   if (activeUserIds.has(userId)) {
     logger.warn(`Token detection is already active for user ${userId}.`);
     return;
@@ -191,15 +205,18 @@ export const startTokenListener = async (userId: number): Promise<void> => {
   activeUserIds.add(userId);
   logger.info(`User ${userId} started token detection.`);
 
+  // Create the subscription only if it doesn't exist yet
   if (listenerId === null) {
-    listenerId = connection.onProgramAccountChange(
+    listenerId = subscriptionConnection.onProgramAccountChange(
       new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-      async (keyedAccountInfo, context) => {
+      async (keyedAccountInfo) => {
+        // Check if we are already processing to avoid overlap
         if (isProcessing) {
           logger.debug('Listener is already processing an event. Skipping this event.');
           return;
         }
 
+        // If no active users remain, there's no need to process
         if (activeUserIds.size === 0) {
           logger.debug('No active users. Listener should be stopped.');
           return;
@@ -210,7 +227,7 @@ export const startTokenListener = async (userId: number): Promise<void> => {
         try {
           const accountId = keyedAccountInfo.accountId.toBase58();
 
-          // Validate mint address before processing
+          // Validate mint address
           if (!isValidMint(accountId)) {
             logger.warn(`Invalid mint address detected: ${accountId}. Skipping.`);
             return;
@@ -218,66 +235,65 @@ export const startTokenListener = async (userId: number): Promise<void> => {
 
           const tokenInfo: TokenInfo = { mintAddress: accountId };
           
-          // Create a snapshot of activeUserIds to allow safe removal during iteration
+          // Snapshot of activeUserIds to safely iterate
           const users = Array.from(activeUserIds);
 
+          // Process for each user
           for (const uid of users) {
             try {
+              // 1) Apply user-defined filters
               const passesFilters = await applyFilters(tokenInfo, uid);
-              if (passesFilters) {
-                logger.info(
-                  `Token ${accountId} passed filters for user ${uid}. Fetching details and sending message.`
-                );
+              if (!passesFilters) {
+                logger.debug(`Token ${accountId} did not pass filters for user ${uid}.`);
+                continue;
+              }
 
-                // Fetch detailed token information from DexScreener
-                const dexData = await fetchTokenDetails(accountId);
+              logger.info(
+                `Token ${accountId} passed filters for user ${uid}. Fetching details and sending message.`
+              );
 
-                // Log DexScreener data for debugging
-                if (dexData) {
-                  logger.debug(
-                    `DexScreener Data for ${accountId}: ${JSON.stringify(
-                      dexData,
-                      null,
-                      2
-                    )}`
+              // 2) Fetch DexScreener data
+              const dexData = await fetchTokenDetails(accountId);
+
+              // 3) Get user settings to check Autobuy
+              const userSettings = await getUserSettings(uid);
+              const autobuy: boolean = userSettings.Autobuy === true;
+
+              // 4) Construct the message
+              const message = await constructTokenMessage(tokenInfo, dexData, autobuy);
+
+              // 5) Send Telegram message
+              await botInstance.api.sendMessage(uid, message, { parse_mode: 'HTML' });
+
+              // 6) If Autobuy is ON, purchase the token
+              if (autobuy) {
+                const purchaseSuccess = await purchaseToken(uid, tokenInfo);
+
+                if (purchaseSuccess) {
+                  logger.info(`Token ${accountId} successfully purchased for user ${uid}.`);
+                  await botInstance.api.sendMessage(
+                    uid,
+                    `✅ <b>Token purchased successfully!</b>`,
+                    { parse_mode: 'HTML' }
+                  );
+                } else {
+                  logger.error(`Failed to purchase token ${accountId} for user ${uid}.`);
+                  await botInstance.api.sendMessage(
+                    uid,
+                    `❌ <b>Failed to purchase the token.</b> Please check your settings or try again later.`,
+                    { parse_mode: 'HTML' }
                   );
                 }
-
-                // Fetch user settings to check Autobuy status
-                const userSettings = await getUserSettings(uid);
-                const autobuy: boolean = userSettings.Autobuy === true;
-
-                // Construct the detailed message
-                const message = await constructTokenMessage(tokenInfo, dexData, autobuy);
-
-                // Send the message to the user via Telegram
-                await botInstance.api.sendMessage(uid, message, { parse_mode: 'HTML' });
-
-                if (autobuy) {
-                  // Perform the token purchase
-                  const purchaseSuccess = await purchaseToken(uid, tokenInfo);
-
-                  if (purchaseSuccess) {
-                    logger.info(`Token ${accountId} successfully purchased for user ${uid}.`);
-                    // Notify the user about the successful purchase
-                    await botInstance.api.sendMessage(uid, `✅ <b>Token purchased successfully!</b>`, { parse_mode: 'HTML' });
-                  } else {
-                    logger.error(`Failed to purchase token ${accountId} for user ${uid}.`);
-                    // Notify the user about the failed purchase
-                    await botInstance.api.sendMessage(uid, `❌ <b>Failed to purchase the token.</b> Please check your settings or try again later.`, { parse_mode: 'HTML' });
-                  }
-                } else {
-                  // Inform the user that Autobuy is off
-                  logger.info(`Autobuy is OFF for user ${uid}. Token ${accountId} not purchased.`);
-                  await botInstance.api.sendMessage(uid, `ℹ️ <b>Autobuy is OFF. Token not purchased.</b> You can enable Autobuy in your settings if you wish to perform automatic purchases.`, { parse_mode: 'HTML' });
-                }
-
-                // Keep the listener active; do not remove the user from activeUserIds
               } else {
-                logger.debug(
-                  `Token ${accountId} did not pass filters for user ${uid}.`
+                // Inform user that Autobuy is off
+                logger.info(`Autobuy is OFF for user ${uid}. Token ${accountId} not purchased.`);
+                await botInstance.api.sendMessage(
+                  uid,
+                  `ℹ️ <b>Autobuy is OFF. Token not purchased.</b> You can enable Autobuy in your settings if you wish to perform automatic purchases.`,
+                  { parse_mode: 'HTML' }
                 );
               }
+
             } catch (error: any) {
               logger.error(
                 `Error processing token ${accountId} for user ${uid}: ${error.message}`,
@@ -286,10 +302,10 @@ export const startTokenListener = async (userId: number): Promise<void> => {
             }
           }
 
-          // After processing all users, check if listener should be removed
+          // After processing all users, check if we should stop the listener
           if (activeUserIds.size === 0 && listenerId !== null) {
             try {
-              connection.removeProgramAccountChangeListener(listenerId);
+              subscriptionConnection.removeProgramAccountChangeListener(listenerId);
               logger.info('Solana token listener stopped as there are no active users.');
               listenerId = null;
             } catch (error: any) {
@@ -302,7 +318,7 @@ export const startTokenListener = async (userId: number): Promise<void> => {
           isProcessing = false; // Release the processing lock
         }
       },
-      'confirmed' // Ensure the commitment level is appropriate
+      'confirmed'
     );
 
     logger.info('Solana token listener started.');
@@ -321,9 +337,10 @@ export const stopTokenListener = async (userId: number): Promise<void> => {
   activeUserIds.delete(userId);
   logger.info(`User ${userId} stopped token detection.`);
 
+  // If no more active users, remove the subscription
   if (activeUserIds.size === 0 && listenerId !== null) {
     try {
-      connection.removeProgramAccountChangeListener(listenerId);
+      subscriptionConnection.removeProgramAccountChangeListener(listenerId);
       logger.info('Solana token listener stopped.');
       listenerId = null;
     } catch (error: any) {

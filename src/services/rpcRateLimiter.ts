@@ -21,13 +21,15 @@ const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4',
   'https://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4',
   'https://mainnet.helius-rpc.com/?api-key=a7582ece-e219-452b-a37f-5a81d45c54d8',
+  'https://mainnet.helius-rpc.com/?api-key=28fe0336-263e-43bf-bbdc-7885668ce881',
 
   // Add more RPC URLs if available for load balancing/failoverhttps://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4
 ];
 
 const connections = rpcUrls.map(url => new Connection(url, 'confirmed'));
 
-const getRandomConnection = () => connections[Math.floor(Math.random() * connections.length)];
+export const getRandomConnection = () =>
+  connections[Math.floor(Math.random() * connections.length)];
 
 // Configure Bottleneck for rate limiting
 const limiter = new Bottleneck({
