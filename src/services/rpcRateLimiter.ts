@@ -19,6 +19,7 @@ const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=28fe0336-263e-43bf-bbdc-7885668ce881',
 ];
 
+// Enhanced interface with additional tracking
 interface RpcConnection {
   url: string;
   connection: Connection;
@@ -26,56 +27,73 @@ interface RpcConnection {
   blacklistedUntil: number;
   consecutiveErrors: number;
   lastUsed: number;
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  lastErrorTime?: number;
 }
 
-// Much stricter rate limits per connection
+// More conservative rate limits
 const createConnectionLimiter = () => new Bottleneck({
   maxConcurrent: 1,
-  minTime: 1000,              // Minimum 1 second between requests
-  reservoir: 10,              // Start with 10 tokens
-  reservoirRefreshAmount: 10, // Refill to 10 tokens
+  minTime: 2000,              // 2 seconds between requests
+  reservoir: 5,               // Start with 5 tokens
+  reservoirRefreshAmount: 5,  // Refill to 5 tokens
   reservoirRefreshInterval: 60 * 1000  // Every 60 seconds
 });
 
-// Significantly reduced global rate limiting
+// Even more conservative global rate limiting
 const globalLimiter = new Bottleneck({
-  maxConcurrent: 2,          // Only 2 concurrent requests globally
-  minTime: 200,              // 200ms between any requests
-  reservoir: 30,             // 30 requests per minute total
-  reservoirRefreshAmount: 30,
+  maxConcurrent: 1,
+  minTime: 500,
+  reservoir: 20,
+  reservoirRefreshAmount: 20,
   reservoirRefreshInterval: 60 * 1000
 });
+
+// Enhanced validator for mint addresses
+const isValidMintAddress = (address: string): boolean => {
+  try {
+    const pubkey = new PublicKey(address);
+    return PublicKey.isOnCurve(pubkey.toBytes());
+  } catch (error) {
+    return false;
+  }
+};
 
 const rpcConnections: RpcConnection[] = rpcUrls.map((url) => ({
   url,
   connection: new Connection(url, {
     commitment: 'confirmed',
-    disableRetryOnRateLimit: true, // We'll handle retries ourselves
+    disableRetryOnRateLimit: true,
   }),
   limiter: createConnectionLimiter(),
   blacklistedUntil: 0,
   consecutiveErrors: 0,
   lastUsed: 0,
+  totalRequests: 0,
+  successfulRequests: 0,
+  failedRequests: 0,
 }));
 
+// Enhanced connection selection with load balancing
 const getHealthyConnection = (): RpcConnection | null => {
   const now = Date.now();
   
-  // Remove blacklisting for connections that have cooled down
   rpcConnections.forEach(conn => {
     if (conn.blacklistedUntil <= now) {
       conn.blacklistedUntil = 0;
-      if (now - conn.lastUsed > 120000) { // 2 minutes without use
-        conn.consecutiveErrors = 0; // Reset errors after cooling period
+      if (now - conn.lastUsed > 300000) { // 5 minutes without use
+        conn.consecutiveErrors = 0;
+        conn.lastErrorTime = undefined;
       }
     }
   });
 
-  // Filter available connections
   const available = rpcConnections.filter(c => 
     c.blacklistedUntil <= now && 
-    c.consecutiveErrors < 2 && // More aggressive error threshold
-    (now - c.lastUsed) >= 1000 // Ensure 1 second between uses of same connection
+    c.consecutiveErrors < 3 &&
+    (now - c.lastUsed) >= 2000
   );
 
   if (available.length === 0) {
@@ -83,51 +101,69 @@ const getHealthyConnection = (): RpcConnection | null => {
     return null;
   }
 
-  // Sort by least recently used and least errors
+  // Enhanced sorting considering success rate
   available.sort((a, b) => {
+    const aSuccessRate = a.successfulRequests / (a.totalRequests || 1);
+    const bSuccessRate = b.successfulRequests / (b.totalRequests || 1);
+    
     const timeDiff = a.lastUsed - b.lastUsed;
-    if (Math.abs(timeDiff) > 5000) { // Significant time difference
-      return timeDiff;
+    const successRateDiff = bSuccessRate - aSuccessRate;
+    
+    if (Math.abs(successRateDiff) > 0.2) {
+      return successRateDiff > 0 ? 1 : -1;
     }
-    return a.consecutiveErrors - b.consecutiveErrors;
+    
+    return timeDiff;
   });
 
   return available[0];
 };
 
+// Enhanced blacklisting with exponential backoff
 const blacklistConnection = (connection: RpcConnection) => {
   connection.consecutiveErrors++;
-  const blacklistDuration = Math.min(
-    180_000 * Math.pow(2, connection.consecutiveErrors - 1), // Longer backoff
-    900_000 // Max 15 minutes
+  connection.failedRequests++;
+  connection.lastErrorTime = Date.now();
+
+  const baseBackoff = 60_000; // 1 minute
+  const maxBackoff = 1800_000; // 30 minutes
+  
+  const backoff = Math.min(
+    baseBackoff * Math.pow(2, connection.consecutiveErrors - 1),
+    maxBackoff
   );
-  connection.blacklistedUntil = Date.now() + blacklistDuration;
+
+  connection.blacklistedUntil = Date.now() + backoff;
+  
   logger.warn(
-    `Endpoint blacklisted for ${blacklistDuration/1000}s after ${connection.consecutiveErrors} errors: ${connection.url}`
+    `Endpoint blacklisted for ${backoff/1000}s after ${connection.consecutiveErrors} errors: ${connection.url}`
   );
 };
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Enhanced retry logic with adaptive delays
 async function executeWithRetry<T>(
   operation: () => Promise<T>,
   description: string,
   connection: RpcConnection,
-  maxRetries = 3
+  maxRetries = 5
 ): Promise<T> {
   let lastError: Error | null = null;
-  let baseDelay = 2000; // Start with 2 second base delay
+  let baseDelay = 1000;
   
+  connection.totalRequests++;
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       connection.lastUsed = Date.now();
       
-      // Use both limiters in series
       const result = await globalLimiter.schedule(() =>
         connection.limiter.schedule(operation)
       );
       
-      connection.consecutiveErrors = 0; // Reset errors on success
+      connection.consecutiveErrors = 0;
+      connection.successfulRequests++;
       return result;
     } catch (error: any) {
       lastError = error;
@@ -141,15 +177,13 @@ async function executeWithRetry<T>(
       
       if (is429) {
         blacklistConnection(connection);
-        // Increase base delay after each 429
         baseDelay = Math.min(baseDelay * 2, 8000);
       }
 
       if (attempt === maxRetries) break;
 
-      // Calculate backoff with jitter
-      const jitter = Math.random() * 1000;
-      const backoff = baseDelay * Math.pow(2, attempt) + jitter;
+      const jitter = Math.random() * baseDelay * 0.1;
+      const backoff = baseDelay * Math.pow(1.5, attempt) + jitter;
       await delay(backoff);
     }
   }
@@ -157,17 +191,18 @@ async function executeWithRetry<T>(
   throw lastError || new Error(`Operation failed: ${description}`);
 }
 
+// Enhanced fallback with pre-validation
 async function executeWithFallback<T>(
   operation: (conn: Connection) => Promise<T>,
   description: string,
-  maxAttempts = 3
+  maxAttempts = 5
 ): Promise<T> {
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const connection = getHealthyConnection();
     if (!connection) {
-      await delay(3000); // Longer delay when no connections available
+      await delay(5000);
       continue;
     }
 
@@ -180,27 +215,31 @@ async function executeWithFallback<T>(
     } catch (error: any) {
       lastError = error;
       if (attempt === maxAttempts - 1) break;
-      await delay(2000); // Delay before trying next connection
+      await delay(3000);
     }
   }
 
   throw lastError || new Error(`All attempts failed for: ${description}`);
 }
 
-// Export for backward compatibility
-export const getRandomConnection = (): Connection => {
-  const conn = getHealthyConnection();
-  return conn ? conn.connection : rpcConnections[0].connection;
-};
+// Enhanced mint validation
+export const getMintWithRateLimit = async (mintAddress: string): Promise<Mint> => {
+  if (!isValidMintAddress(mintAddress)) {
+    throw new Error(`Invalid mint address format: ${mintAddress}`);
+  }
 
-export const getMintWithRateLimit = async (mintAddress: string): Promise<Mint> =>
-  executeWithFallback(
+  return executeWithFallback(
     (connection) => getMint(connection, new PublicKey(mintAddress)),
     `getMint for ${mintAddress}`
   );
+};
 
-export const getTokenSupplyWithRateLimit = async (mintAddress: string): Promise<TokenAmount> =>
-  executeWithFallback(
+export const getTokenSupplyWithRateLimit = async (mintAddress: string): Promise<TokenAmount> => {
+  if (!isValidMintAddress(mintAddress)) {
+    throw new Error(`Invalid mint address format: ${mintAddress}`);
+  }
+
+  return executeWithFallback(
     async (connection) => {
       const resp = await connection.getTokenSupply(new PublicKey(mintAddress));
       if (!resp.value.uiAmountString) {
@@ -210,11 +249,16 @@ export const getTokenSupplyWithRateLimit = async (mintAddress: string): Promise<
     },
     `getTokenSupply for ${mintAddress}`
   );
+};
 
 export const getTokenLargestAccountsWithRateLimit = async (
   mintAddress: string
-): Promise<TokenAccountBalancePair[]> =>
-  executeWithFallback(
+): Promise<TokenAccountBalancePair[]> => {
+  if (!isValidMintAddress(mintAddress)) {
+    throw new Error(`Invalid mint address format: ${mintAddress}`);
+  }
+
+  return executeWithFallback(
     async (connection) => {
       const resp = await connection.getTokenLargestAccounts(new PublicKey(mintAddress));
       if (!resp.value) {
@@ -224,11 +268,16 @@ export const getTokenLargestAccountsWithRateLimit = async (
     },
     `getTokenLargestAccounts for ${mintAddress}`
   );
+};
 
 export const getParsedAccountInfoWithRateLimit = async (
   pubkey: string
-): Promise<AccountInfo<ParsedAccountData> | null> =>
-  executeWithFallback(
+): Promise<AccountInfo<ParsedAccountData> | null> => {
+  if (!isValidMintAddress(pubkey)) {
+    throw new Error(`Invalid public key format: ${pubkey}`);
+  }
+
+  return executeWithFallback(
     async (connection) => {
       const resp = await connection.getParsedAccountInfo(new PublicKey(pubkey));
       if (resp.value && typeof resp.value.data === 'object' && 'parsed' in resp.value.data) {
@@ -238,3 +287,10 @@ export const getParsedAccountInfoWithRateLimit = async (
     },
     `getParsedAccountInfo for ${pubkey}`
   );
+};
+
+// Export for backward compatibility
+export const getRandomConnection = (): Connection => {
+  const conn = getHealthyConnection();
+  return conn ? conn.connection : rpcConnections[0].connection;
+};
