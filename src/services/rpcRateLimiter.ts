@@ -14,8 +14,8 @@ import { getMint, Mint } from '@solana/spl-token';
 import { logger } from '../utils/logger';
 
 /**
- * Replace with your own RPC keys or endpoints.
- * Make sure you do NOT list duplicates unless absolutely needed.
+ * List your RPC endpoints carefully. 
+ * Avoid duplicates, or you risk quickly blacklisting them all.
  */
 const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=34f4403f-f9da-4d03-a6df-3de140c97f06',
@@ -26,15 +26,14 @@ const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=28fe0336-263e-43bf-bbdc-7885668ce881',
 ];
 
-/**
- * A small structure to hold the RPC URL, the Connection, and a “blacklistedUntil” timestamp.
- */
+/** Each RPC connection plus a blacklistedUntil timestamp. */
 interface RpcConnection {
   url: string;
   connection: Connection;
   blacklistedUntil: number; // epoch ms
 }
 
+/** Create an array of connections; none are blacklisted initially. */
 const rpcConnections: RpcConnection[] = rpcUrls.map((url) => ({
   url,
   connection: new Connection(url, 'confirmed'),
@@ -42,61 +41,59 @@ const rpcConnections: RpcConnection[] = rpcUrls.map((url) => ({
 }));
 
 /**
- * Retrieve a random Connection that is NOT blacklisted.
- * If all are blacklisted, we pick the one which will be freed soonest,
- * but also log a warning to wait or reduce rate.
+ * Get a random Connection that isn’t blacklisted. 
+ * If all are blacklisted, pick the earliest to be free 
+ * (and warn that we might fail).
  */
 export const getRandomConnection = (): Connection => {
   const now = Date.now();
-  const validConnections = rpcConnections.filter((c) => c.blacklistedUntil <= now);
+  const valid = rpcConnections.filter((c) => c.blacklistedUntil <= now);
 
-  if (validConnections.length === 0) {
-    // All blacklisted; pick the earliest recovery
+  if (valid.length === 0) {
+    // All blacklisted
     rpcConnections.sort((a, b) => a.blacklistedUntil - b.blacklistedUntil);
     const earliest = rpcConnections[0];
     logger.warn(
-      `All RPC endpoints are temporarily blacklisted. Using ${earliest.url} but requests may fail.`
+      `All endpoints are blacklisted. Using ${earliest.url} but requests may fail.`
     );
     return earliest.connection;
   }
 
-  const chosen = validConnections[Math.floor(Math.random() * validConnections.length)];
+  const chosen = valid[Math.floor(Math.random() * valid.length)];
   logger.debug(`Using RPC endpoint: ${chosen.url}`);
   return chosen.connection;
 };
 
-/**
- * Blacklist an RPC URL for a short period if we get a 429 response.
+/** 
+ * Blacklist an endpoint for 2–3 minutes if we get a 429 
+ * or similar error. 
  */
 export const blacklistEndpoint = (url: string): void => {
   const now = Date.now();
-  const blacklistDuration = 60_000; // e.g. 1 minute
-  for (const rpcConn of rpcConnections) {
-    if (rpcConn.url === url) {
-      rpcConn.blacklistedUntil = now + blacklistDuration;
-      logger.warn(
-        `Blacklisting endpoint for 60s due to 429 errors: ${url}`
-      );
+  const blacklistMs = 2 * 60_000; // 2 minutes, adjust to 3 if needed
+  for (const rc of rpcConnections) {
+    if (rc.url === url) {
+      rc.blacklistedUntil = now + blacklistMs;
+      logger.warn(`Endpoint blacklisted for 2 min due to 429: ${url}`);
     }
   }
 };
 
-// Configure Bottleneck for rate limiting
+/** Bottleneck config with stricter limits. */
 const limiter = new Bottleneck({
-  reservoir: 100,              // Maximum 100 requests
-  reservoirRefreshAmount: 100, // Reset to 100
+  reservoir: 30,               // only 30 requests per reservoir cycle
+  reservoirRefreshAmount: 30,  // reset back to 30
   reservoirRefreshInterval: 60 * 1000, // every 60 seconds
-  maxConcurrent: 3,            // Up to 3 concurrent
-  minTime: 200,                // ~5 calls/second if reservoir is available
+  maxConcurrent: 1,            // only 1 request at a time
+  minTime: 300,                // 300ms between requests => ~3.3 calls/second
 });
 
-/**
- * Delay execution for a specified number of milliseconds.
- */
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Delay helper */
+const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
 /**
- * A wrapper for retrying a function call with exponential backoff.
+ * Retry logic with exponential backoff. 
+ * If we see 429, we blacklist the endpoint for a while.
  */
 const retryWrapper = async <T>(
   fn: () => Promise<T>,
@@ -105,7 +102,7 @@ const retryWrapper = async <T>(
   retries = 5
 ): Promise<T> => {
   let attempt = 0;
-  const execute = async (): Promise<T> => {
+  async function run(): Promise<T> {
     try {
       return await fn();
     } catch (error: any) {
@@ -113,51 +110,49 @@ const retryWrapper = async <T>(
 
       const is429 =
         (error.response && error.response.status === 429) ||
-        (error.code === '429') ||
         error.message?.includes('429') ||
         error.message?.includes('Too Many Requests');
 
       const isRetryable =
         is429 ||
         (error.response && [500, 502, 503].includes(error.response.status)) ||
-        error.code === 'ECONNRESET' ||
-        error.code === 'ETIMEDOUT';
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ECONNRESET';
 
       if (is429) {
-        // Blacklist this endpoint for 1 minute
+        // Blacklist this endpoint for a few minutes
         blacklistEndpoint(endpointUrl);
       }
 
       if (attempt < retries && isRetryable) {
-        const jitter = Math.random() * 100;
-        const backoff = Math.pow(2, attempt) * 500 + jitter; // exponential
         attempt++;
+        const jitter = Math.random() * 100;
+        const backoff = Math.pow(2, attempt) * 500 + jitter;
         logger.warn(
           `${description} failed with ${
             error.response?.status || error.code || 'Unknown'
           }. Retrying in ${backoff.toFixed(0)}ms... (Attempt ${attempt}/${retries})`
         );
         await delay(backoff);
-        return execute();
+        return run();
       } else {
-        logger.error(`${description} failed after ${attempt} attempt(s): ${error.message}`);
+        logger.error(
+          `${description} failed after ${attempt} attempt(s): ${error.message}`
+        );
         throw error;
       }
     }
-  };
-  return execute();
+  }
+  return run();
 };
 
-// ------------------------------
-// Rate-Limited, Retry-Wrapped RPC calls
-// ------------------------------
-
-/**
- * Fetch the Mint info for a given mint address, with rate limiting and retries.
+/** 
+ * Rate-limited and retry-wrapped calls.
  */
+
 export const getMintWithRateLimit = async (mintAddress: string): Promise<Mint> => {
   const connection = getRandomConnection();
-  const endpointUrl = (connection as any)._rpcEndpoint; // internal usage
+  const endpointUrl = (connection as any)._rpcEndpoint; // internal
   return limiter.schedule(() =>
     retryWrapper(
       () => getMint(connection, new PublicKey(mintAddress)),
@@ -167,83 +162,48 @@ export const getMintWithRateLimit = async (mintAddress: string): Promise<Mint> =
   );
 };
 
-/**
- * Fetch the token supply for a given mint address, with rate limiting and retries.
- */
 export const getTokenSupplyWithRateLimit = async (mintAddress: string): Promise<TokenAmount> => {
   const connection = getRandomConnection();
   const endpointUrl = (connection as any)._rpcEndpoint;
   return limiter.schedule(() =>
-    retryWrapper(
-      async () => {
-        const response: RpcResponseAndContext<TokenAmount> = await connection.getTokenSupply(
-          new PublicKey(mintAddress)
-        );
-        if (!response.value.uiAmountString) {
-          throw new Error('uiAmountString is undefined');
-        }
-        return response.value;
-      },
-      `getTokenSupply for ${mintAddress}`,
-      endpointUrl
-    )
+    retryWrapper(async () => {
+      const resp = await connection.getTokenSupply(new PublicKey(mintAddress));
+      if (!resp.value.uiAmountString) {
+        throw new Error('uiAmountString is undefined');
+      }
+      return resp.value;
+    }, `getTokenSupply for ${mintAddress}`, endpointUrl)
   );
 };
 
-/**
- * Fetches the largest token accounts for a given mint address, with rate limiting and retries.
- */
 export const getTokenLargestAccountsWithRateLimit = async (
   mintAddress: string
 ): Promise<TokenAccountBalancePair[]> => {
   const connection = getRandomConnection();
   const endpointUrl = (connection as any)._rpcEndpoint;
   return limiter.schedule(() =>
-    retryWrapper(
-      async () => {
-        const response: RpcResponseAndContext<TokenAccountBalancePair[]> =
-          await connection.getTokenLargestAccounts(new PublicKey(mintAddress));
-        if (!response.value) {
-          throw new Error('Largest accounts value is undefined');
-        }
-        return response.value;
-      },
-      `getTokenLargestAccounts for ${mintAddress}`,
-      endpointUrl
-    )
+    retryWrapper(async () => {
+      const resp = await connection.getTokenLargestAccounts(new PublicKey(mintAddress));
+      if (!resp.value) {
+        throw new Error('No largest accounts returned');
+      }
+      return resp.value;
+    }, `getTokenLargestAccounts for ${mintAddress}`, endpointUrl)
   );
 };
 
-/**
- * Fetches parsed account info for a given public key, with rate limiting and retries.
- */
 export const getParsedAccountInfoWithRateLimit = async (
-  publicKey: string
+  pubkey: string
 ): Promise<AccountInfo<ParsedAccountData> | null> => {
   const connection = getRandomConnection();
   const endpointUrl = (connection as any)._rpcEndpoint;
   return limiter.schedule(() =>
-    retryWrapper(
-      async () => {
-        const response: RpcResponseAndContext<
-          AccountInfo<Buffer | ParsedAccountData> | null
-        > = await connection.getParsedAccountInfo(new PublicKey(publicKey));
-
-        const accountInfo = response.value;
-        if (
-          accountInfo &&
-          accountInfo.data &&
-          typeof accountInfo.data === 'object' &&
-          'parsed' in accountInfo.data
-        ) {
-          // It's ParsedAccountData
-          return accountInfo as AccountInfo<ParsedAccountData>;
-        }
-        return null;
-      },
-      `getParsedAccountInfo for ${publicKey}`,
-      endpointUrl
-    )
+    retryWrapper(async () => {
+      const resp = await connection.getParsedAccountInfo(new PublicKey(pubkey));
+      if (resp.value && typeof resp.value.data === 'object' && 'parsed' in resp.value.data) {
+        return resp.value as AccountInfo<ParsedAccountData>;
+      }
+      return null;
+    }, `getParsedAccountInfo for ${pubkey}`, endpointUrl)
   );
 };
-
