@@ -1,5 +1,3 @@
-// src/services/tokenDataService.ts
-
 import { PublicKey, Connection, clusterApiUrl } from '@solana/web3.js';
 import { getCache, setCache } from './cacheService';
 import axios from 'axios';
@@ -35,7 +33,8 @@ interface TokenDataPayload {
   };
 }
 
-const MAX_RETRIES = 5;
+// Reduce from 5 to 2 or 3 if you like to limit spammy logs
+const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 500;
 const FETCH_TIMEOUT_MS = 30000;
 const CACHE_KEY = 'splTokenData';
@@ -69,7 +68,7 @@ async function isLikelyValidMint(mintAddress: string): Promise<boolean> {
 
 /**
  * Use a cached approach to fetch all 82-byte mint accounts
- * from a Solana program scan.
+ * from a Solana program scan (via Helius).
  */
 export const fetchSplTokenDataWithCache = async (): Promise<TokenDataPayload[]> => {
   const cachedData = await getCache(CACHE_KEY);
@@ -101,7 +100,8 @@ export const fetchSplTokenDataWithCache = async (): Promise<TokenDataPayload[]> 
       resolve([]);
     }, FETCH_TIMEOUT_MS);
 
-    const url = 'https://mainnet.helius-rpc.com/?api-key=34f4403f-f9da-4d03-a6df-3de140c97f06';
+    // Example Helius endpoint with your key
+    const url = 'https://mainnet.helius-rpc.com/?api-key=a7582ece-e219-452b-a37f-5a81d45c54d8';
 
     let attempt = 0;
     let backoff = INITIAL_BACKOFF_MS;
@@ -119,7 +119,7 @@ export const fetchSplTokenDataWithCache = async (): Promise<TokenDataPayload[]> 
                 TOKEN_PROGRAM_ID.toBase58(),
                 {
                   encoding: 'jsonParsed',
-                  filters: [{ dataSize: 82 }], // Mint accounts = 82 bytes
+                  filters: [{ dataSize: 82 }], // Only mint accounts = 82 bytes
                 },
               ],
             },
@@ -135,7 +135,7 @@ export const fetchSplTokenDataWithCache = async (): Promise<TokenDataPayload[]> 
             resolve(tokens);
             return;
           } else if (response.status === 429) {
-            logger.warn(`Rate limit (429) encountered. Wait ${backoff}ms and retry...`);
+            logger.warn(`Rate limit (429) encountered. Waiting ${backoff}ms and retrying...`);
             await delay(backoff);
             backoff = Math.min(backoff * 2, 60000);
           } else {
@@ -143,16 +143,14 @@ export const fetchSplTokenDataWithCache = async (): Promise<TokenDataPayload[]> 
               `Unexpected response: ${response.status}, Data: ${JSON.stringify(response.data).slice(
                 0,
                 200
-              )}. Retry...`
+              )}. Retrying...`
             );
             await delay(backoff);
             backoff = Math.min(backoff * 2, 60000);
           }
         } catch (error: any) {
           const message = axios.isAxiosError(error) ? error.message : String(error);
-          logger.warn(
-            `Attempt ${attempt + 1} failed: ${message}. Wait ${backoff}ms and retry...`
-          );
+          logger.warn(`Attempt ${attempt + 1} failed: ${message}. Waiting ${backoff}ms and retrying...`);
           await delay(backoff);
           backoff = Math.min(backoff * 2, 60000);
         }
@@ -171,11 +169,9 @@ export const fetchSplTokenDataWithCache = async (): Promise<TokenDataPayload[]> 
 };
 
 /**
- * Attempt to get the Mint info from chain,
- * skipping if it’s not valid or can’t parse.
+ * Safely fetch the Mint info from chain, skipping if invalid or can't parse.
  */
 const safeGetMintInfo = async (mintAddress: string): Promise<Mint | null> => {
-  // Quick parse check:
   let pubkey: PublicKey;
   try {
     pubkey = new PublicKey(mintAddress);
@@ -191,7 +187,7 @@ const safeGetMintInfo = async (mintAddress: string): Promise<Mint | null> => {
     return null;
   }
 
-  // Fetch the chain data
+  // Fetch chain data
   try {
     const mintInfo: Mint = await getMintWithRateLimit(mintAddress);
     return mintInfo;
@@ -202,8 +198,7 @@ const safeGetMintInfo = async (mintAddress: string): Promise<Mint | null> => {
 };
 
 /**
- * Return a naive “liquidity” by minted supply (minus non-circulating).
- * Adjust as needed for your use-case.
+ * Example "liquidity" function by minted supply. Adjust for your use-case.
  */
 export const getLiquidity = async (mintAddress: string): Promise<number> => {
   const mintInfo = await safeGetMintInfo(mintAddress);
@@ -212,7 +207,7 @@ export const getLiquidity = async (mintAddress: string): Promise<number> => {
     return 0;
   }
   const totalSupply = Number(mintInfo.supply) / Math.pow(10, mintInfo.decimals);
-  // If you want to subtract any known non-circulating, do so here:
+  // Subtract any known non-circulating if you wish
   const nonCirculatingSupply = 0;
   const circulatingSupply = totalSupply - nonCirculatingSupply;
   logger.info(`Calculated circulating supply for ${mintAddress}: ${circulatingSupply}`);
@@ -234,7 +229,7 @@ export const getTopHoldersConcentration = async (
   mintAddress: string,
   topN = 10
 ): Promise<number> => {
-  // Quick parse check:
+  // Quick parse check
   let pubkey: PublicKey;
   try {
     pubkey = new PublicKey(mintAddress);
@@ -243,36 +238,35 @@ export const getTopHoldersConcentration = async (
     return 0;
   }
 
-  // Check if it's a valid mint account
   const valid = await isLikelyValidMint(mintAddress);
   if (!valid) {
     logger.warn(`Not a valid mint structure: ${mintAddress}. Skipping concentration calc.`);
     return 0;
   }
 
-  // Continue with largest accounts
   try {
     const largestAccounts: TokenAccountBalancePair[] =
       await getTokenLargestAccountsWithRateLimit(mintAddress);
+
     if (!largestAccounts || largestAccounts.length === 0) {
       logger.warn(`No token accounts found for mint ${mintAddress}.`);
       return 0;
     }
+
     const supplyResponse: TokenAmount = await getTokenSupplyWithRateLimit(mintAddress);
     const totalSupply = supplyResponse.uiAmount || 0;
     if (totalSupply === 0) {
       logger.warn(`Total supply is zero for ${mintAddress}. Cannot compute concentration.`);
       return 0;
     }
+
     const sortedAccounts = largestAccounts.sort(
       (a, b) => (b.uiAmount || 0) - (a.uiAmount || 0)
     );
     const topAccounts = sortedAccounts.slice(0, topN);
     const topSum = topAccounts.reduce((sum, acc) => sum + (acc.uiAmount || 0), 0);
     const concentration = (topSum / totalSupply) * 100;
-    logger.info(
-      `Top ${topN} holders concentration for ${mintAddress}: ${concentration.toFixed(2)}%`
-    );
+    logger.info(`Top ${topN} holders concentration for ${mintAddress}: ${concentration.toFixed(2)}%`);
     return concentration;
   } catch (error: any) {
     logger.error(`Error in getTopHoldersConcentration for ${mintAddress}:`, error);
@@ -281,11 +275,10 @@ export const getTopHoldersConcentration = async (
 };
 
 /**
- * Called whenever you detect a new token or want to process it.
- * Adjust as needed for your pipeline.
+ * Example pipeline step once a new token is detected.
+ * Adjust as needed.
  */
 export const processNewToken = async (mintAddress: string) => {
-  // Basic parse check:
   try {
     new PublicKey(mintAddress);
   } catch {
@@ -328,4 +321,3 @@ export const getCirculatingSupply = async (): Promise<number> => {
     return 0;
   }
 };
-

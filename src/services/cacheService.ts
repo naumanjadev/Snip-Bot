@@ -1,12 +1,10 @@
-// src/services/cacheService.ts
-
-import { createClient } from 'redis'; // Use named import for Redis v4+
+import { createClient } from 'redis'; // Redis v4+
 import { logger } from '../utils/logger';
 import { config } from '../config';
 
 // Initialize Redis client with the redisUrl from config
 const client = createClient({
-  url: config.redisUrl, // Correctly reference redisUrl
+  url: config.redisUrl, // e.g., "redis://localhost:6379" or "rediss://..."
 });
 
 // Handle Redis client errors

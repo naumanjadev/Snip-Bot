@@ -14,6 +14,7 @@ const rpcUrls = [
   'https://mainnet.helius-rpc.com/?api-key=34f4403f-f9da-4d03-a6df-3de140c97f06',
   'https://mainnet.helius-rpc.com/?api-key=a10fd0ea-2f74-4fb0-bcc3-81dea10eed97',
   'https://mainnet.helius-rpc.com/?api-key=b8332ac9-558f-4da7-9de0-01d8f9c139f0',
+  'https://mainnet.helius-rpc.com/?api-key=04beb6c3-21a5-4a66-9b3f-3547bceca91d',
   'https://mainnet.helius-rpc.com/?api-key=84ed7da1-c0cf-438b-81a0-fa94a72b89a4',
   'https://mainnet.helius-rpc.com/?api-key=a7582ece-e219-452b-a37f-5a81d45c54d8',
   'https://mainnet.helius-rpc.com/?api-key=28fe0336-263e-43bf-bbdc-7885668ce881',
@@ -34,13 +35,14 @@ interface RpcConnection {
 }
 
 // More conservative rate limits
-const createConnectionLimiter = () => new Bottleneck({
-  maxConcurrent: 1,
-  minTime: 2000,              // 2 seconds between requests
-  reservoir: 5,               // Start with 5 tokens
-  reservoirRefreshAmount: 5,  // Refill to 5 tokens
-  reservoirRefreshInterval: 60 * 1000  // Every 60 seconds
-});
+const createConnectionLimiter = () =>
+  new Bottleneck({
+    maxConcurrent: 1,
+    minTime: 2000, // 2 seconds between requests
+    reservoir: 5, // Start with 5 tokens
+    reservoirRefreshAmount: 5, // Refill to 5 tokens
+    reservoirRefreshInterval: 60 * 1000, // Every 60 seconds
+  });
 
 // Even more conservative global rate limiting
 const globalLimiter = new Bottleneck({
@@ -48,14 +50,14 @@ const globalLimiter = new Bottleneck({
   minTime: 500,
   reservoir: 20,
   reservoirRefreshAmount: 20,
-  reservoirRefreshInterval: 60 * 1000
+  reservoirRefreshInterval: 60 * 1000,
 });
 
 // Enhanced validator for mint addresses
 const isValidMintAddress = (address: string): boolean => {
   try {
-    const pubkey = new PublicKey(address);
-    return PublicKey.isOnCurve(pubkey.toBytes());
+    new PublicKey(address);
+    return true;
   } catch (error) {
     return false;
   }
@@ -79,21 +81,21 @@ const rpcConnections: RpcConnection[] = rpcUrls.map((url) => ({
 // Enhanced connection selection with load balancing
 const getHealthyConnection = (): RpcConnection | null => {
   const now = Date.now();
-  
-  rpcConnections.forEach(conn => {
+
+  // Remove blacklisting if the backoff time has passed
+  rpcConnections.forEach((conn) => {
     if (conn.blacklistedUntil <= now) {
       conn.blacklistedUntil = 0;
-      if (now - conn.lastUsed > 300000) { // 5 minutes without use
+      // If unused for >5 minutes, reset error counters
+      if (now - conn.lastUsed > 300000) {
         conn.consecutiveErrors = 0;
         conn.lastErrorTime = undefined;
       }
     }
   });
 
-  const available = rpcConnections.filter(c => 
-    c.blacklistedUntil <= now && 
-    c.consecutiveErrors < 3 &&
-    (now - c.lastUsed) >= 2000
+  const available = rpcConnections.filter(
+    (c) => c.blacklistedUntil <= now && c.consecutiveErrors < 3 && Date.now() - c.lastUsed >= 2000
   );
 
   if (available.length === 0) {
@@ -101,18 +103,20 @@ const getHealthyConnection = (): RpcConnection | null => {
     return null;
   }
 
-  // Enhanced sorting considering success rate
+  // Sort by best success rate, then by least recently used
   available.sort((a, b) => {
     const aSuccessRate = a.successfulRequests / (a.totalRequests || 1);
     const bSuccessRate = b.successfulRequests / (b.totalRequests || 1);
-    
+
     const timeDiff = a.lastUsed - b.lastUsed;
     const successRateDiff = bSuccessRate - aSuccessRate;
-    
+
+    // If success rates differ significantly, prefer the higher one
     if (Math.abs(successRateDiff) > 0.2) {
       return successRateDiff > 0 ? 1 : -1;
     }
-    
+
+    // Otherwise prefer the one that was used less recently
     return timeDiff;
   });
 
@@ -127,41 +131,40 @@ const blacklistConnection = (connection: RpcConnection) => {
 
   const baseBackoff = 60_000; // 1 minute
   const maxBackoff = 1800_000; // 30 minutes
-  
-  const backoff = Math.min(
-    baseBackoff * Math.pow(2, connection.consecutiveErrors - 1),
-    maxBackoff
-  );
+
+  const backoff = Math.min(baseBackoff * Math.pow(2, connection.consecutiveErrors - 1), maxBackoff);
 
   connection.blacklistedUntil = Date.now() + backoff;
-  
+
   logger.warn(
-    `Endpoint blacklisted for ${backoff/1000}s after ${connection.consecutiveErrors} errors: ${connection.url}`
+    `Endpoint blacklisted for ${backoff / 1000}s after ${connection.consecutiveErrors} errors: ${
+      connection.url
+    }`
   );
 };
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Enhanced retry logic with adaptive delays
+// Lower this from 5 to 3 or so to cut down spam
 async function executeWithRetry<T>(
   operation: () => Promise<T>,
   description: string,
   connection: RpcConnection,
-  maxRetries = 5
+  maxRetries = 3
 ): Promise<T> {
   let lastError: Error | null = null;
   let baseDelay = 1000;
-  
+
   connection.totalRequests++;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       connection.lastUsed = Date.now();
-      
+
       const result = await globalLimiter.schedule(() =>
         connection.limiter.schedule(operation)
       );
-      
+
       connection.consecutiveErrors = 0;
       connection.successfulRequests++;
       return result;
@@ -172,9 +175,8 @@ async function executeWithRetry<T>(
         error.message || error
       );
 
-      const is429 = error.message?.includes('429') || 
-                    error.message?.includes('Too Many Requests');
-      
+      // Only blacklist if the actual HTTP status is 429
+      const is429 = error?.response?.status === 429;
       if (is429) {
         blacklistConnection(connection);
         baseDelay = Math.min(baseDelay * 2, 8000);
@@ -195,7 +197,7 @@ async function executeWithRetry<T>(
 async function executeWithFallback<T>(
   operation: (conn: Connection) => Promise<T>,
   description: string,
-  maxAttempts = 5
+  maxAttempts = 3
 ): Promise<T> {
   let lastError: Error | null = null;
 
@@ -207,11 +209,7 @@ async function executeWithFallback<T>(
     }
 
     try {
-      return await executeWithRetry(
-        () => operation(connection.connection),
-        description,
-        connection
-      );
+      return await executeWithRetry(() => operation(connection.connection), description, connection);
     } catch (error: any) {
       lastError = error;
       if (attempt === maxAttempts - 1) break;
@@ -289,7 +287,10 @@ export const getParsedAccountInfoWithRateLimit = async (
   );
 };
 
-// Export for backward compatibility
+/**
+ * For backward compatibility if other modules use "getRandomConnection" directly.
+ * However, for the subscription listener, we no longer use this random approach.
+ */
 export const getRandomConnection = (): Connection => {
   const conn = getHealthyConnection();
   return conn ? conn.connection : rpcConnections[0].connection;
