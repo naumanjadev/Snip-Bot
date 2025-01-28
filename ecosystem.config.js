@@ -1,22 +1,22 @@
 module.exports = {
   apps: [
     {
-      name: "solana-trading-bot", // Name of the application
-      script: "dist/index.js",     // Path to the compiled JavaScript file
-      cwd: "./",                   // Current working directory
-      watch: false,                // Disable file watching for production
-      instances: 1,                // Only one instance
-      exec_mode: "fork",           // Fork mode
-      autorestart: true,           // Automatically restart on crash
-      max_memory_restart: "3.5G",  // Correct format for memory limit (3.5 GB)
+      name: "solana-trading-bot",
+      script: "dist/index.js",
+      cwd: "./",
+      watch: false,
+      instances: 1,
+      exec_mode: "fork",
+      autorestart: true,
+      max_memory_restart: "3584M", 
       env: {
-        NODE_ENV: "production",    // Environment configuration
-        UV_THREADPOOL_SIZE: 2,     // Use both CPU cores for thread pooling
+        NODE_ENV: "production",
+        UV_THREADPOOL_SIZE: 2,
       },
-      log_date_format: "YYYY-MM-DD HH:mm:ss", // Log timestamp format
-      error_file: "logs/pm2-error.log",       // Path for error logs
-      out_file: "logs/pm2-out.log",           // Path for output logs
-      merge_logs: true,            // Merge logs from all instances
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      error_file: "logs/pm2-error.log",
+      out_file: "logs/pm2-out.log",
+      merge_logs: true,
     },
   ],
 };
