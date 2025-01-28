@@ -5,10 +5,10 @@ module.exports = {
       script: "dist/index.js",     // Path to the compiled JavaScript file
       cwd: "./",                   // Current working directory
       watch: false,                // Disable file watching for production
-      instances: 1,                // Only one instance to use all resources
-      exec_mode: "fork",           // Fork mode since we're running one instance
+      instances: 1,                // Only one instance
+      exec_mode: "fork",           // Fork mode
       autorestart: true,           // Automatically restart on crash
-      max_memory_restart: "3.4G",  // Restart if memory usage exceeds 3.5GB
+      max_memory_restart: "3.5G",  // Correct format for memory limit (3.5 GB)
       env: {
         NODE_ENV: "production",    // Environment configuration
         UV_THREADPOOL_SIZE: 2,     // Use both CPU cores for thread pooling
